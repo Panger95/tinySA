@@ -69,11 +69,11 @@ static const digi_profile_t digi_profiles[] = {
     {
         .label = "W - 2.4",
         .sweep_start_hz = 2400000000ULL,
-        .sweep_stop_hz = 2500000000ULL,
+        .sweep_stop_hz = 2483500000ULL,
         .channel_count = 16,
         .channel_base_hz = 2405000000ULL,
         .channel_step_hz = 5000000ULL,
-        .channel_width_hz = 5000000ULL,
+        .channel_width_hz = 2000000ULL,
         .use_hex_labels = 1,
         .first_channel_number = 0,
     },
@@ -141,10 +141,9 @@ static const digi_profile_t *active_digi_profile(void) {
 }
 
 static void digi_get_channel_label(const digi_profile_t *p, int index, char *out, int out_sz) {
-  (void)p;
-  int ch = index;
+  int ch = (p ? p->first_channel_number : 0) + index;
 
-  if (ch >= 0 && ch < 16) {
+  if (p && p->use_hex_labels && ch >= 0 && ch < 16) {
     if (out_sz > 0) out[0] = ch < 10 ? '0' + ch : 'A' + (ch - 10);
     if (out_sz > 1) out[1] = 0;
     return;
@@ -2222,6 +2221,15 @@ static int channel_overlay_visible_count(const digi_profile_t *profile) {
   return CHANNEL_OVERLAY_VISIBLE_COUNT;
 }
 
+static int channel_overlay_freq_to_x(freq_t freq, freq_t start, freq_t stop,
+                                     int plot_width) {
+  if (freq <= start) return 0;
+  if (freq >= stop) return plot_width;
+
+  freq_t span = stop - start;
+  return (int)((((uint64_t)(freq - start) * plot_width) + (span / 2)) / span);
+}
+
 static bool channel_overlay_channel_pixels(const digi_profile_t *profile, int channel,
                                            int plot_width, int *x0, int *x1,
                                            int *center_x) {
@@ -2229,14 +2237,32 @@ static bool channel_overlay_channel_pixels(const digi_profile_t *profile, int ch
 
   if (!profile || plot_width <= 0 || channel < 0 || channel >= visible_count) return false;
 
-  int left = (channel * plot_width) / visible_count;
-  int right = ((channel + 1) * plot_width) / visible_count;
+  freq_t sweep_start = get_sweep_frequency(ST_START);
+  freq_t sweep_stop = get_sweep_frequency(ST_STOP);
+  freq_t channel_width = profile->channel_width_hz
+                             ? profile->channel_width_hz
+                             : profile->channel_step_hz;
+  if (sweep_stop <= sweep_start || channel_width == 0) return false;
+
+  freq_t center = profile->channel_base_hz + (freq_t)channel * profile->channel_step_hz;
+  freq_t lower_half = channel_width / 2;
+  freq_t upper_half = channel_width - lower_half;
+  freq_t left_freq = center > lower_half ? center - lower_half : 0;
+  freq_t right_freq = center + upper_half;
+
+  if (right_freq <= sweep_start || left_freq >= sweep_stop) return false;
+
+  int left = channel_overlay_freq_to_x(left_freq, sweep_start, sweep_stop, plot_width);
+  int right = channel_overlay_freq_to_x(right_freq, sweep_start, sweep_stop, plot_width);
   if (right <= left) right = left + 1;
+  if (left < 0) left = 0;
+  if (left > plot_width) left = plot_width;
   if (right > plot_width) right = plot_width;
 
   if (x0) *x0 = left;
   if (x1) *x1 = right;
-  if (center_x) *center_x = (left + right) / 2;
+  if (center_x)
+    *center_x = channel_overlay_freq_to_x(center, sweep_start, sweep_stop, plot_width);
   return right > left;
 }
 
@@ -2282,8 +2308,18 @@ bool select_channel_overlay(int touch_x, int touch_y) {
   touch_x -= OFFSETX;
   if (touch_x < 0 || touch_x >= plot_width) return false;
 
-  int channel = (touch_x * visible_count) / plot_width;
-  if (channel < 0 || channel >= visible_count) return false;
+  int channel = -1;
+  for (int i = 0; i < visible_count; i++) {
+    int x0;
+    int x1;
+    if (!channel_overlay_channel_pixels(profile, i, plot_width, &x0, &x1, NULL))
+      continue;
+    if (touch_x >= x0 && touch_x < x1) {
+      channel = i;
+      break;
+    }
+  }
+  if (channel < 0) return false;
 
   int previous_channel = selected_overlay_channel;
   selected_overlay_channel = (selected_overlay_channel == channel) ? -1 : channel;
@@ -2395,9 +2431,14 @@ static void draw_channel_overlay_grid(int plot_width) {
   if (visible_count <= 0) return;
 
   ili9341_set_foreground(LCD_DARK_GREY);
-  for (int channel = 0; channel <= visible_count; channel++) {
-    int x = OFFSETX + (channel * plot_width) / visible_count;
-    ili9341_line(x, CHANNEL_HEADER_HEIGHT, x, CHART_BOTTOM - 1);
+  for (int channel = 0; channel < visible_count; channel++) {
+    int x0;
+    int x1;
+    if (!channel_overlay_channel_pixels(profile, channel, plot_width, &x0, &x1, NULL))
+      continue;
+    ili9341_line(OFFSETX + x0, CHANNEL_HEADER_HEIGHT, OFFSETX + x0, CHART_BOTTOM - 1);
+    ili9341_line(OFFSETX + x1 - 1, CHANNEL_HEADER_HEIGHT, OFFSETX + x1 - 1,
+                 CHART_BOTTOM - 1);
   }
 }
 
